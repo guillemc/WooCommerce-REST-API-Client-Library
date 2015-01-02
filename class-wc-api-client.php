@@ -14,7 +14,7 @@ class WC_API_Client {
 	/**
 	 * API base endpoint
 	 */
-	const API_ENDPOINT = 'wc-api/v1/';
+	const API_ENDPOINT = 'wc-api/v2/';
 
 	/**
 	 * The HASH alorithm to use for oAuth signature, SHA256 or SHA1
@@ -46,10 +46,13 @@ class WC_API_Client {
 	private $_is_ssl;
 
 	/**
-	 * Return the API data as an Object, set to false to keep it in JSON string format
+	 * Return the API data as an array, object, or keep it in JSON string format
 	 * @var boolean
 	 */
-	private $_return_as_object = true;
+	private $_return_as = 'array';
+
+	private $_headers = array();
+    private $_links = array();
 
 	/**
 	 * Default contructor
@@ -82,7 +85,7 @@ class WC_API_Client {
 	/**
 	 * Get all orders
 	 * @param  array  $params
-	 * @return mixed|jason string
+	 * @return mixed|json string
 	 */
 	public function get_orders( $params = array() ) {
 		return $this->_make_api_call( 'orders', $params );
@@ -317,8 +320,12 @@ class WC_API_Client {
 	 * Set the return data as object
 	 * @param boolean $is_object
 	 */
-	public function set_return_as_object( $is_object = true ) {
-		$this->_return_as_object = $is_object;
+	public function set_return_as( $type ) {
+        $valid = array('array', 'object', 'string');
+        if (!in_array($type, $valid)) {
+            throw new Exception("invalid return type $type: must be one of '".implode("', ", $valid)."'");
+        }
+		$this->_return_as = $type;
 	}
 
 	/**
@@ -330,23 +337,23 @@ class WC_API_Client {
 	 */
 	private function _make_api_call( $endpoint, $params = array(), $method = 'GET' ) {
 		$ch = curl_init();
+		$this->_headers = array();
+        $this->_links = array();
+
+        $urlParams = $method === 'GET' ? $params : array();
 
 		// Check if we must use Basic Auth or 1 legged oAuth, if SSL we use basic, if not we use OAuth 1.0a one-legged
 		if ( $this->_is_ssl ) {
 			curl_setopt( $ch, CURLOPT_USERPWD, $this->_consumer_key . ":" . $this->_consumer_secret );
 		} else {
-			$params['oauth_consumer_key'] = $this->_consumer_key;
-			$params['oauth_timestamp'] = time();
-			$params['oauth_nonce'] = sha1( microtime() );
-			$params['oauth_signature_method'] = 'HMAC-' . self::HASH_ALGORITHM;
-			$params['oauth_signature'] = $this->generate_oauth_signature( $params, $method, $endpoint );
+			$urlParams['oauth_consumer_key'] = $this->_consumer_key;
+			$urlParams['oauth_timestamp'] = time();
+			$urlParams['oauth_nonce'] = sha1( microtime() );
+			$urlParams['oauth_signature_method'] = 'HMAC-' . self::HASH_ALGORITHM;
+			$urlParams['oauth_signature'] = $this->generate_oauth_signature( $urlParams, $method, $endpoint );
 		}
 
-		if ( isset( $params ) && is_array( $params ) ) {
-			$paramString = '?' . http_build_query( $params );
-		} else {
-			$paramString = null;
-		}
+        $paramString = $urlParams ? '?'.http_build_query($urlParams) : '';
 
 		// Set up the enpoint URL
 		curl_setopt( $ch, CURLOPT_URL, $this->_api_url . $endpoint . $paramString );
@@ -354,28 +361,73 @@ class WC_API_Client {
 		curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, 30 );
         curl_setopt( $ch, CURLOPT_TIMEOUT, 30 );
         curl_setopt( $ch, CURLOPT_RETURNTRANSFER, true );
+        curl_setopt( $ch, CURLOPT_HEADER, 1 );
 
         if ( 'POST' === $method ) {
 			curl_setopt( $ch, CURLOPT_POST, true );
 			curl_setopt( $ch, CURLOPT_POSTFIELDS, json_encode( $params ) );
-    	} else if ( 'DELETE' === $method ) {
+    	} elseif ('PUT' === $method ) {
+    	    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "PUT");
+            curl_setopt($ch, CURLOPT_POSTFIELDS,json_encode( $params ) );
+		} elseif ( 'DELETE' === $method ) {
 			curl_setopt( $ch, CURLOPT_CUSTOMREQUEST, 'DELETE' );
     	}
 
-		$return = curl_exec( $ch );
+		$response = curl_exec( $ch );
 
-		$code = curl_getinfo( $ch, CURLINFO_HTTP_CODE );
+        if ( empty( $response ) ) {
+            $code = curl_errno($ch);
+            $msg = curl_error($ch);
+            if (!$code) {
+                $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $msg = $code;
+            }
+			$body = json_encode(array(
+                'errors' => array(array('code' => $code, 'message' => $msg)),
+            ));
+		} else {
+            //list($header, $body) = explode("\r\n\r\n", $response, 2);
+            $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+            $header = substr($response, 0, $header_size);
+            $body = substr($response, $header_size);
+            $this->_headers = http_parse_headers($header);
+            $this->set_links();
+        }
 
-		if ( $this->_return_as_object ) {
-			$return = json_decode( $return );
-		}
-
-		if ( empty( $return ) ) {
-			$return = '{"errors":[{"code":"' . $code . '","message":"cURL HTTP error ' . $code . '"}]}';
-			$return = json_decode( $return );
-		}
-		return $return;
+        curl_close($ch);
+		return $this->format_output($body);
 	}
+
+    private function format_output($json_str)
+    {
+        switch ($this->_return_as) {
+            case 'array': return json_decode($json_str, true);
+            case 'object': return json_decode($json_str, false);
+        }
+        return $json_str;
+    }
+
+    private function set_links()
+    {
+        if (!$this->_headers || empty($this->_headers['Link'])) return;
+        $a = $this->_headers['Link'];
+        if (!is_array($a)) $a = array($this->_headers['Link']);
+        foreach ($a as $v) {
+            if (preg_match("/\<([^\>]+)\>\s*;\s*rel=\"(next|last|first|prev)\"/", $v, $matches)) {
+                $this->_links[$matches[2]] = $matches[1];
+            }
+        }
+    }
+
+    public function get_headers()
+	{
+	    return $this->_headers;
+	}
+
+    public function get_links()
+    {
+        return $this->_links;
+    }
 
 	/**
 	 * Generate oAuth signature
@@ -440,5 +492,35 @@ class WC_API_Client {
 
 		return $normalized_parameters;
 	}
+
+}
+
+if (!function_exists('http_parse_headers'))
+{
+    function http_parse_headers($raw_headers) {
+        $headers = array();
+        $key = '';
+        foreach (explode("\n", $raw_headers) as $i => $h) {
+            $h = explode(':', $h, 2);
+
+            if (isset($h[1])) {
+                if (!isset($headers[$h[0]]))
+                    $headers[$h[0]] = trim($h[1]);
+                elseif (is_array($headers[$h[0]])) {
+                    $headers[$h[0]] = array_merge($headers[$h[0]], array(trim($h[1])));
+                } else {
+                    $headers[$h[0]] = array_merge(array($headers[$h[0]]), array(trim($h[1])));
+                }
+                $key = $h[0];
+            } else {
+                if (substr($h[0], 0, 1) == "\t") {
+                    $headers[$key] .= "\r\n\t".trim($h[0]);
+                } elseif (!$key) {
+                    $headers[0] = trim($h[0]);
+                }
+            }
+        }
+        return $headers;
+    }
 
 }
